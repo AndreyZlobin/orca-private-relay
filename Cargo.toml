@@ -1,0 +1,31 @@
+[package]
+name = "orca-private-relay"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Single-user self-hosted relay compatible with stock Orca 1.4.245"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws", "form"] }
+base64 = "0.22"
+crypto_box = { version = "0.9", features = ["std"] }
+futures-util = "0.3"
+hmac = "0.12"
+rand = "0.8"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["full"] }
+url = "2"
+
+[dev-dependencies]
+tokio-tungstenite = "0.29"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

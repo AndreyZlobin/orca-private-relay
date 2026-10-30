@@ -1,0 +1,36 @@
+[Unit]
+Description=Private Orca-compatible Rust relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orca-relay
+Group=orca-relay
+WorkingDirectory=/var/lib/orca-private-relay
+EnvironmentFile=/etc/orca-private-relay.env
+ExecStart=/usr/local/bin/orca-private-relay
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+UMask=0077
+StateDirectory=orca-private-relay
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=192M
+TasksMax=64
+LimitNOFILE=1024
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=orca-private-relay
+
+[Install]
+WantedBy=multi-user.target

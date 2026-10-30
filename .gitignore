@@ -1,0 +1,8 @@
+/target/
+/.research/
+/.private/
+*.env
+*.sqlite*
+/.cargo-cache/
+__pycache__/
+.DS_Store
