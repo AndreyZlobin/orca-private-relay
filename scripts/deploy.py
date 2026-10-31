@@ -1,48 +1,184 @@
-"""Build on your VPS in a disposable container and install the native service."""
+"""Prepare a bare VPS, build the relay, configure HTTPS and verify public readiness."""
 import argparse
+import hashlib
+import ipaddress
 import json
 import pathlib
+import re
 import shlex
+import socket
 import subprocess
 import tarfile
+import time
+import urllib.error
 import urllib.parse
+import urllib.request
 
-root = pathlib.Path(__file__).resolve().parent.parent
-parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--host', help='SSH destination, e.g. deploy@203.0.113.10')
-parser.add_argument('--origin', help='HTTPS origin, e.g. https://relay.example.com')
-args = parser.parse_args()
-config_path = root / '.private/deploy.json'
-config = json.loads(config_path.read_text()) if config_path.exists() else {}
-host = args.host or config.get('ssh_host')
-origin = args.origin or config.get('origin')
-if not host or not origin:
-    parser.error('set --host and --origin, or create .private/deploy.json')
-if host.startswith('-') or any(c.isspace() for c in host):
-    parser.error('invalid SSH destination')
-url = urllib.parse.urlparse(origin)
-if url.scheme != 'https' or not url.hostname or origin != 'https://' + url.hostname:
-    parser.error('origin must be an HTTPS hostname without a path or trailing slash')
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+IMAGE = 'rust:1.97.1-slim-bookworm@sha256:2775a09d208ff0d7c1f50490c45b62db929e87ba1dcbc3f2132ac71a704bcdd3'
 
-image = 'rust:1.97.1-slim-bookworm@sha256:2775a09d208ff0d7c1f50490c45b62db929e87ba1dcbc3f2132ac71a704bcdd3'
-command = (
-    'sudo -n install -d -m 755 /opt/orca-private-relay && '
-    'sudo -n tar -xzf - -C /opt/orca-private-relay && '
-    'sudo -n docker run --rm --name orca-relay-build --cpus=0.75 '
-    '--memory=1100m --memory-swap=1300m -e CARGO_BUILD_JOBS=1 '
-    '-e CARGO_HOME=/build/.cargo-cache -v /opt/orca-private-relay:/build '
-    '-w /build ' + shlex.quote(image) + ' cargo build --release --locked && '
-    'sudo -n env RELAY_DEPLOY_ORIGIN=' + shlex.quote(origin) +
-    ' sh /opt/orca-private-relay/deploy/install.sh'
-)
-process = subprocess.Popen(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host, command], stdin=subprocess.PIPE)
-assert process.stdin is not None
-try:
-    with tarfile.open(fileobj=process.stdin, mode='w|gz') as archive:
-        for name in ['Cargo.toml', 'Cargo.lock', 'src', 'deploy', 'THIRD_PARTY_NOTICES.md', 'LICENSE', 'README.md']:
-            archive.add(root / name, arcname=name, filter=lambda info: None if '__pycache__' in info.name else info)
-finally:
-    process.stdin.close()
-code = process.wait()
-if code:
-    raise SystemExit(code)
+
+def resolve_origin(config):
+    origin = config.get('origin')
+    if not origin:
+        host = config.get('public_ipv4') or config['ssh_host'].rsplit('@', 1)[-1]
+        try:
+            addresses = [ipaddress.ip_address(host)]
+        except ValueError:
+            try:
+                addresses = [ipaddress.ip_address(r[4][0]) for r in socket.getaddrinfo(host, None, socket.AF_INET)]
+            except OSError as e:
+                raise ValueError('Cannot derive a public IP from SSH alias; set origin or public_ipv4') from e
+        public = next((ip for ip in addresses if ip.version == 4 and ip.is_global), None)
+        if not public:
+            raise ValueError('Automatic HTTPS requires a public IPv4; set origin explicitly')
+        origin = f'https://orca-relay.{str(public).replace(".", "-")}.sslip.io'
+    if not isinstance(origin, str) or not re.fullmatch(r'https://[a-z0-9][a-z0-9.-]*[a-z0-9]', origin):
+        raise ValueError('origin must be an HTTPS hostname without a port, path or trailing slash')
+    parsed = urllib.parse.urlparse(origin)
+    if origin != 'https://' + (parsed.hostname or ''):
+        raise ValueError('Invalid HTTPS origin')
+    return origin
+
+
+def ssh_args(config):
+    host = config.get('ssh_host', '')
+    if not isinstance(host, str) or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@:\[\]-]*', host):
+        raise ValueError('Invalid SSH destination')
+    port = config.get('ssh_port', 22)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError('ssh_port must be between 1 and 65535')
+    args = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=accept-new', '-p', str(port)]
+    if config.get('ssh_key'):
+        key = pathlib.Path(config['ssh_key']).expanduser()
+        if not key.is_file():
+            raise ValueError('SSH private key does not exist')
+        args += ['-i', str(key)]
+    return args + [host]
+
+
+def source_hash(root=ROOT):
+    digest = hashlib.sha256(IMAGE.encode())
+    paths = [root / 'Cargo.toml', root / 'Cargo.lock', *sorted((root / 'src').rglob('*.rs'))]
+    for path in paths:
+        digest.update(str(path.relative_to(root)).encode() + b'\0')
+        content = path.read_bytes()
+        digest.update(len(content).to_bytes(8, 'big') + content)
+    return digest.hexdigest()
+
+
+def remote(ssh, command, *, data=None, capture=False):
+    result = subprocess.run([*ssh, command], input=data, capture_output=capture, check=False)
+    if result.returncode:
+        detail = result.stderr.decode(errors='replace').strip() if capture and result.stderr else ''
+        raise RuntimeError(f'Remote command failed ({result.returncode}): {detail}')
+    return result.stdout.decode().strip() if capture else ''
+
+
+def verify_health(origin, timeout=120):
+    deadline = time.monotonic() + timeout
+    error = 'not ready'
+    while True:
+        try:
+            with urllib.request.urlopen(origin + '/healthz', timeout=8) as response:
+                result = json.load(response)
+            if result.get('ok') is True and result.get('service') == 'orca-private-relay':
+                return result
+            error = 'unexpected health response'
+        except (OSError, ValueError) as e:
+            error = str(e)
+        if time.monotonic() >= deadline:
+            raise RuntimeError('Public HTTPS is not ready. Check DNS and provider-level TCP 80/443 rules. ' + error)
+        time.sleep(2)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--host', help='SSH destination; root or passwordless sudo required')
+    parser.add_argument('--origin', help='HTTPS hostname; omit to derive an sslip.io name from the VPS IPv4')
+    parser.add_argument('--config', type=pathlib.Path, default=ROOT / '.private/deploy.json')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--plan', action='store_true', help='Read-only dependency and build plan')
+    modes.add_argument('--status', action='store_true', help='Read current service and public HTTPS status')
+    parser.add_argument('--rebuild', action='store_true', help='Force rebuilding the native binary')
+    args = parser.parse_args(argv)
+    try:
+        config = json.loads(args.config.read_text()) if args.config.exists() else {}
+        if not isinstance(config, dict):
+            parser.error('Configuration must be a JSON object')
+    except (OSError, ValueError) as error:
+        parser.error(f'Cannot read configuration: {error}')
+    if args.host:
+        if args.host != config.get('ssh_host') and not args.origin:
+            # A new VPS must not accidentally take the previous server's hostname.
+            config.pop('origin', None)
+            config.pop('public_ipv4', None)
+        config['ssh_host'] = args.host
+    if args.origin:
+        config['origin'] = args.origin
+    try:
+        ssh = ssh_args(config)
+        origin = resolve_origin(config)
+        user_id = remote(ssh, 'id -u', capture=True)
+        elevate = '' if user_id == '0' else 'sudo -n '
+        remote(ssh, elevate + 'true')
+        print('Relay endpoint:', origin, flush=True)
+        if args.status:
+            remote(ssh, elevate + 'systemctl show orca-private-relay -p ActiveState -p MainPID -p NRestarts -p MemoryCurrent')
+            print('Public HTTPS:', verify_health(origin, timeout=0))
+            return
+        digest = source_hash()
+        reuse_check = (
+            'test -x /usr/local/bin/orca-private-relay && '
+            f'test "$(cat /opt/orca-private-relay/.installed-source.sha256 2>/dev/null)" = {digest} && '
+            'test "$(sha256sum /usr/local/bin/orca-private-relay | cut -d " " -f1)" = '
+            '"$(cat /opt/orca-private-relay/.installed-binary.sha256 2>/dev/null)" && echo reuse || echo build'
+        )
+        reuse = remote(ssh, elevate + 'sh -c ' + shlex.quote(reuse_check), capture=True) == 'reuse' and not args.rebuild
+        print('Binary:', 'reuse unchanged release' if reuse else 'build release on VPS', flush=True)
+        mode = '--plan' if args.plan else 'apply'
+        command = elevate + 'env RELAY_NEED_BUILD=' + ('0' if reuse else '1') + ' sh -s -- ' + mode
+        remote(ssh, command, data=(ROOT / 'deploy/bootstrap.sh').read_bytes())
+        if args.plan:
+            return
+        remote(ssh, elevate + 'install -d -m 755 /opt/orca-private-relay')
+        process = subprocess.Popen([*ssh, elevate + 'tar -xzf - -C /opt/orca-private-relay'], stdin=subprocess.PIPE)
+        assert process.stdin is not None
+        try:
+            with tarfile.open(fileobj=process.stdin, mode='w|gz') as archive:
+                for name in ['Cargo.toml', 'Cargo.lock', 'src', 'deploy', 'THIRD_PARTY_NOTICES.md', 'LICENSE', 'README.md']:
+                    archive.add(ROOT / name, arcname=name, filter=lambda info: None if '__pycache__' in info.name else info)
+        finally:
+            process.stdin.close()
+        if process.wait():
+            raise RuntimeError('Source upload failed')
+        if not reuse:
+            build = (
+                'docker run --rm --name orca-relay-build --cpus=0.75 --memory=1100m --memory-swap=1300m '
+                '-e CARGO_BUILD_JOBS=1 -e CARGO_HOME=/build/.cargo-cache '
+                '-v /opt/orca-private-relay:/build -w /build ' + shlex.quote(IMAGE) + ' cargo build --release --locked'
+            )
+            remote(ssh, elevate + build)
+        install = elevate + 'env RELAY_DEPLOY_ORIGIN=' + shlex.quote(origin) + ' RELAY_SOURCE_SHA256=' + digest + ' RELAY_REUSE_BINARY=' + ('1' if reuse else '0') + ' sh /opt/orca-private-relay/deploy/install.sh'
+        remote(ssh, install)
+        print('Waiting for trusted public HTTPS...', flush=True)
+        verify_health(origin)
+        private = ROOT / '.private'
+        private.mkdir(mode=0o700, exist_ok=True)
+        private.chmod(0o700)
+        secret = remote(ssh, elevate + 'python3 -c ' + shlex.quote("from pathlib import Path; d=dict(l.split('=',1) for l in Path('/etc/orca-private-relay.env').read_text().splitlines() if '=' in l); print(d['RELAY_OWNER_SECRET'])"), capture=True)
+        key = private / 'owner.key'
+        key.write_text(secret)
+        key.chmod(0o600)
+        config['origin'] = origin
+        args.config.parent.mkdir(parents=True, exist_ok=True)
+        args.config.write_text(json.dumps(config, indent=2) + '\n')
+        args.config.chmod(0o600)
+        print('Ready. Owner key saved privately to .private/owner.key (not printed).')
+        print('Next on Mac: python3 scripts/configure-mac.py')
+    except (ValueError, RuntimeError, OSError) as e:
+        parser.exit(1, f'Error: {e}\n')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,13 @@
+[Unit]
+Description=Allow private Orca relay HTTPS ingress
+Before=orca-private-relay.service
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/orca-private-relay/firewall.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
