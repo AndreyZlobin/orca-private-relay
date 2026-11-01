@@ -49,6 +49,47 @@ async fn post(addr: std::net::SocketAddr, path: &str, v: Value, token: Option<&s
     serde_json::from_str(&body).unwrap()
 }
 type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+
+#[tokio::test]
+async fn setup_code_authorizes_one_pkce_login_without_owner_key() {
+    let s = test_server();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(s.clone());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    assert_eq!(http(addr, "/admin/setup-codes", "{}", None, "application/json").await.0, 401);
+    let issued = post(addr, "/admin/setup-codes", json!({}), Some("owner")).await;
+    let setup_code = issued["code"].as_str().unwrap();
+    assert_eq!(http(addr, "/admin/setup-codes", "{}", Some(setup_code), "application/json").await.0, 401);
+    for _ in 0..2 {
+        let checked = post(addr, "/v1/setup/check", json!({"code": setup_code}), None).await;
+        assert_eq!(checked["ok"], true);
+    }
+    let verifier = random();
+    let nonce = random();
+    let state = random();
+    let query = json!({"client_id":"orca-desktop","response_type":"code","redirect_uri":"http://127.0.0.1:43210/auth/callback","nonce":nonce,"state":state,"code_challenge":hash(&verifier),"code_challenge_method":"S256","local_profile_id":"new-mac"});
+    let mut bad = query.clone();
+    bad["redirect_uri"] = json!("https://another.example.com/callback");
+    let form = |q: &Value| {
+        let mut out = url::form_urlencoded::Serializer::new(String::new());
+        out.append_pair("password", setup_code);
+        out.append_pair("request", &URL_SAFE_NO_PAD.encode(q.to_string()));
+        out.finish()
+    };
+    assert_eq!(http(addr, "/v1/desktop/auth/authorize", &form(&bad), None, "application/x-www-form-urlencoded").await.0, 400);
+    let (status, headers, _) = http(addr, "/v1/desktop/auth/authorize", &form(&query), None, "application/x-www-form-urlencoded").await;
+    assert_eq!(status, 303);
+    let location = headers.lines().find_map(|line| line.strip_prefix("location: ")).unwrap();
+    let url = url::Url::parse(location.trim()).unwrap();
+    let code = url.query_pairs().find(|(k, _)| k == "code").unwrap().1.to_string();
+    let session = post(addr, "/v1/desktop/auth/session", json!({"code":code,"codeVerifier":verifier,"nonce":nonce,"state":state,"redirectUri":query["redirect_uri"],"localProfileId":"new-mac"}), None).await;
+    assert!(session["accessToken"].as_str().is_some());
+    assert_eq!(http(addr, "/v1/setup/check", &json!({"code":setup_code}).to_string(), None, "application/json").await.0, 401);
+    assert_eq!(http(addr, "/v1/desktop/auth/authorize", &form(&query), None, "application/x-www-form-urlencoded").await.0, 401);
+    task.abort();
+}
+
 async fn send(socket: &mut Socket, v: Value) {
     socket
         .send(Message::Text(v.to_string().into()))

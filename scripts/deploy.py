@@ -131,7 +131,9 @@ def main(argv=None):
     modes.add_argument('--plan', action='store_true', help='Read-only dependency and build plan')
     modes.add_argument('--status', action='store_true', help='Read current service and public HTTPS status')
     parser.add_argument('--rebuild', action='store_true', help='Force rebuilding the native binary')
-    parser.add_argument('--ask-pass', action='store_true', help='Prompt once for the VPS SSH password instead of using a key')
+    auth = parser.add_mutually_exclusive_group()
+    auth.add_argument('--ask-pass', action='store_true', help='Prompt once for the VPS SSH password; remember this login method')
+    auth.add_argument('--key-auth', action='store_true', help='Use SSH keys even if password login was previously selected')
     args = parser.parse_args(argv)
     try:
         config = json.loads(args.config.read_text()) if args.config.exists() else {}
@@ -149,7 +151,10 @@ def main(argv=None):
         config['origin'] = args.origin
     connections = contextlib.ExitStack()
     try:
-        ssh = connections.enter_context(ssh_connection(config, args.ask_pass))
+        if config.get('ssh_auth') not in [None, 'key', 'password']:
+            raise ValueError('ssh_auth must be key or password')
+        password_login = args.ask_pass or (not args.key_auth and config.get('ssh_auth') == 'password')
+        ssh = connections.enter_context(ssh_connection(config, password_login))
         origin = resolve_origin(config)
         user_id = remote(ssh, 'id -u', capture=True)
         elevate = '' if user_id == '0' else 'sudo -n '
@@ -203,6 +208,7 @@ def main(argv=None):
         key.write_text(secret)
         key.chmod(0o600)
         config['origin'] = origin
+        config['ssh_auth'] = 'password' if password_login else 'key'
         args.config.parent.mkdir(parents=True, exist_ok=True)
         args.config.write_text(json.dumps(config, indent=2) + '\n')
         args.config.chmod(0o600)

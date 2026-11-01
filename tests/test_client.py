@@ -18,6 +18,32 @@ KEY = 'k' * 43
 
 
 class ClientSetupTests(unittest.TestCase):
+    def test_setup_code_never_copies_the_owner_key_or_persists_the_code(self):
+        code = 'ABCD-EFGH-JKLM'
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            with patch.object(client, 'ROOT', root), \
+                 patch.object(client.platform, 'system', return_value='Darwin'), \
+                 patch.object(client.pathlib.Path, 'is_dir', return_value=True), \
+                 patch.object(client, 'health', return_value={'ok': True}), \
+                 patch.object(client, 'request_json', return_value={'ok': True, 'origin': ORIGIN}) as request, \
+                 patch.object(client.subprocess, 'run') as run, \
+                 patch.object(client, 'restart_orca'), contextlib.redirect_stdout(io.StringIO()):
+                client.connect(origin=ORIGIN, code=code)
+            request.assert_called_once_with(ORIGIN, '/v1/setup/check', data={'code': code})
+            self.assertEqual(run.call_args_list[-1].kwargs['input'], code.encode())
+            self.assertFalse((root / '.private/connection.json').exists())
+            self.assertNotIn(code, (root / '.private/client.json').read_text())
+
+    def test_code_issuer_prints_a_connection_command_but_not_the_owner_secret(self):
+        code = 'ABCD-EFGH-JKLM'
+        output = io.StringIO()
+        with patch.object(client, 'request_json', return_value={'code': code, 'origin': ORIGIN}) as request, contextlib.redirect_stdout(output):
+            client.print_setup_code(ORIGIN, KEY)
+        request.assert_called_once_with(ORIGIN, '/admin/setup-codes', KEY, data={})
+        self.assertIn('./relay connect ' + ORIGIN + ' --code ' + code, output.getvalue())
+        self.assertNotIn(KEY, output.getvalue())
+
     def test_profile_is_private_and_a_secret_cannot_be_sent_to_another_origin(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

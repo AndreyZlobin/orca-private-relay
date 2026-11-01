@@ -1,5 +1,6 @@
 mod auth;
 mod relay;
+mod setup;
 
 use axum::{
     Json, Router,
@@ -64,6 +65,8 @@ pub struct Data {
     devices: HashMap<String, relay::Device>,
     installs: HashMap<String, Value>,
     epochs: HashMap<String, u64>,
+    #[serde(default)]
+    setup_codes: HashMap<String, setup::SetupCode>,
 }
 pub struct Store {
     db: Connection,
@@ -160,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
 
 fn router(state: App) -> Router {
     Router::new()
-        .route("/healthz",get(||async {Json(json!({"ok":true,"service":"orca-private-relay","protocol":"orca-1.4.245","version":env!("CARGO_PKG_VERSION")}))}))
+        .route("/healthz",get(||async {Json(json!({"ok":true,"service":"orca-private-relay","protocol":"orca-1.4.245","version":env!("CARGO_PKG_VERSION"),"features":["setup-codes-v1"]}))}))
         .route("/v1/desktop/auth/authorize",get(auth::login_page).post(auth::authorize))
         .route("/v1/desktop/auth/session",post(auth::exchange))
         .route("/v1/desktop/auth/refresh",post(auth::refresh))
@@ -174,6 +177,8 @@ fn router(state: App) -> Router {
         .route("/v1/host/data/{id}",get(relay::data_upgrade))
         .route("/v1/connect/{host}",get(relay::phone_upgrade))
         .route("/admin/status",get(status))
+        .route("/admin/setup-codes",post(setup::issue))
+        .route("/v1/setup/check",post(setup::check))
         .layer(DefaultBodyLimit::max(32*1024))
         .with_state(state)
 }

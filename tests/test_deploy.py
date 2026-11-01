@@ -72,6 +72,19 @@ class DeploymentTests(unittest.TestCase):
                     self.fail('A failed login must not enter the deployment')
         run.assert_called_once()
 
+    def test_saved_password_method_is_used_without_repeating_the_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = pathlib.Path(directory) / 'deploy.json'
+            config.write_text(json.dumps({'ssh_host': 'deploy@host', 'origin': 'https://relay.example.com', 'ssh_auth': 'password'}))
+            @contextlib.contextmanager
+            def connection(settings, ask_pass):
+                self.assertTrue(ask_pass)
+                yield ['ssh', 'deploy@host']
+            def remote(_ssh, command, **kwargs):
+                return '1000' if command == 'id -u' else 'build' if 'installed-source' in command else ''
+            with patch.object(deploy, 'ssh_connection', side_effect=connection), patch.object(deploy, 'remote', side_effect=remote), contextlib.redirect_stdout(io.StringIO()):
+                deploy.main(['--config', str(config), '--plan'])
+
     def test_plan_cannot_install_upload_or_fetch_credentials(self):
         calls = []
         def remote(_ssh, command, **kwargs):

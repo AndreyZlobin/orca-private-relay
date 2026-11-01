@@ -93,32 +93,26 @@ pub async fn login_page(
     Query(q): Query<LoginQuery>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
     validate(&q)?;
+    Ok(login_response(&q, None, StatusCode::OK))
+}
+fn login_response(q: &LoginQuery, error: Option<&str>, status: StatusCode) -> Response {
     let request = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&q).unwrap());
+    let error = error.map(|message| format!("<p role=alert>{}</p>", escape(message))).unwrap_or_default();
     let html = format!(
-        "<!doctype html><html lang=ru><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Private Orca Relay</title><style>body{{font:18px system-ui;background:#11131a;color:#eee;max-width:440px;margin:14vh auto;padding:24px}}input,button{{box-sizing:border-box;width:100%;padding:14px;margin-top:18px;border-radius:10px;border:1px solid #667}}button{{background:#a6b8ff;color:#111;font-weight:700}}</style><h1>Private Orca Relay</h1><p>Вход на ваш собственный сервер. Этот пароль не связан с аккаунтом Orca.</p><form method=post><input type=hidden name=request value=\"{}\"><label>Ключ владельца<input type=password name=password required autocomplete=current-password></label><button>Подключить Orca</button></form></html>",
+        "<!doctype html><html lang=ru><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Private Orca Relay</title><style>body{{font:18px system-ui;background:#11131a;color:#eee;max-width:440px;margin:14vh auto;padding:24px}}input,button{{box-sizing:border-box;width:100%;padding:14px;margin-top:18px;border-radius:10px;border:1px solid #667}}button{{background:#a6b8ff;color:#111;font-weight:700}}</style><h1>Подключить Orca</h1><p>Введите код, который показала программа установки. Он действует 10 минут и используется один раз.</p>{error}<form method=post><input type=hidden name=request value=\"{}\"><label>Код подключения<input type=password name=password required autocomplete=one-time-code></label><button>Подключить Orca</button></form></html>",
         escape(&request)
     );
-    let mut r = Html(html).into_response();
+    let mut r = (status, Html(html)).into_response();
     r.headers_mut()
         .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     r.headers_mut().insert(header::CONTENT_SECURITY_POLICY,"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'".parse().unwrap());
-    Ok(r)
+    r
 }
 pub async fn authorize(
     State(s): State<App>,
     Form(f): Form<LoginForm>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
-    {
-        let mut attempts = s.login_attempts.lock().unwrap();
-        attempts.retain(|t| *t + 60_000 > now());
-        if attempts.len() >= 12 {
-            return Err(fail(StatusCode::TOO_MANY_REQUESTS, "login_rate_limit"));
-        }
-        attempts.push(now());
-    }
-    if !same(&hash(&f.password), &s.owner_hash) {
-        return Err(denied());
-    }
+    setup::rate_limit(&s)?;
     let bytes = URL_SAFE_NO_PAD
         .decode(f.request)
         .map_err(|_| bad("invalid_request"))?;
@@ -133,6 +127,14 @@ pub async fn authorize(
     codes.retain(|_, v| v.expires > now());
     if codes.len() >= 16 {
         return Err(fail(StatusCode::TOO_MANY_REQUESTS, "code_limit"));
+    }
+    if !same(&hash(&f.password), &s.owner_hash) {
+        if let Err(error) = setup::consume(&s, &f.password) {
+            if error.0 == StatusCode::UNAUTHORIZED {
+                return Ok(login_response(&q, Some("Код неверен, истёк или уже использован. Получите новый код командой ./relay code на установочном компьютере."), StatusCode::UNAUTHORIZED));
+            }
+            return Err(error);
+        }
     }
     codes.insert(
         hash(code),
