@@ -208,6 +208,7 @@ def main(argv=None):
         args.config.chmod(0o600)
         print('Ready. Owner key saved privately to .private/owner.key (not printed).')
         print('Next on Mac: python3 scripts/configure-mac.py')
+        return config
     except (ValueError, RuntimeError, OSError) as e:
         parser.exit(1, f'Error: {e}\n')
     finally:
