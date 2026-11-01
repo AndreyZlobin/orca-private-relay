@@ -1,5 +1,6 @@
 """Prepare a bare VPS, build the relay, configure HTTPS and verify public readiness."""
 import argparse
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -9,6 +10,7 @@ import shlex
 import socket
 import subprocess
 import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -41,20 +43,48 @@ def resolve_origin(config):
     return origin
 
 
-def ssh_args(config):
+def ssh_args(config, *, password_login=False):
     host = config.get('ssh_host', '')
     if not isinstance(host, str) or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@:\[\]-]*', host):
         raise ValueError('Invalid SSH destination')
     port = config.get('ssh_port', 22)
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError('ssh_port must be between 1 and 65535')
-    args = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=accept-new', '-p', str(port)]
-    if config.get('ssh_key'):
+    args = ['ssh', '-o', 'BatchMode=' + ('no' if password_login else 'yes'), '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=accept-new', '-p', str(port)]
+    if password_login:
+        args += ['-o', 'PreferredAuthentications=password', '-o', 'PubkeyAuthentication=no', '-o', 'KbdInteractiveAuthentication=no']
+    elif config.get('ssh_key'):
         key = pathlib.Path(config['ssh_key']).expanduser()
         if not key.is_file():
             raise ValueError('SSH private key does not exist')
         args += ['-i', str(key)]
     return args + [host]
+
+
+@contextlib.contextmanager
+def ssh_connection(config, ask_pass=False):
+    if not ask_pass:
+        yield ssh_args(config)
+        return
+    args = ssh_args(config, password_login=True)
+    # A short, private socket path also fits macOS's Unix-socket path limit.
+    with tempfile.TemporaryDirectory(prefix='orca-ssh-', dir='/tmp') as directory:
+        control = ['-o', 'ControlPath=' + str(pathlib.Path(directory) / 'control')]
+        master = [*args[:-1], *control, '-M', '-N', '-f', '-o', 'ControlPersist=300', args[-1]]
+        print('Enter the VPS login password at the SSH prompt (not saved).', flush=True)
+        result = subprocess.run(master, check=False)
+        if result.returncode:
+            raise RuntimeError('Password SSH login failed; the VPS must already permit password login for this user')
+        try:
+            # BatchMode prevents an interrupted master from consuming uploaded data
+            # as interactive input. All commands share the authenticated connection.
+            yield ['ssh', '-o', 'BatchMode=yes', '-o', 'ControlMaster=no', *control, *args[1:]]
+        finally:
+            try:
+                subprocess.run([*args[:-1], *control, '-O', 'exit', args[-1]],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                pass  # ControlPersist also expires an idle master after five minutes.
 
 
 def source_hash(root=ROOT):
@@ -101,6 +131,7 @@ def main(argv=None):
     modes.add_argument('--plan', action='store_true', help='Read-only dependency and build plan')
     modes.add_argument('--status', action='store_true', help='Read current service and public HTTPS status')
     parser.add_argument('--rebuild', action='store_true', help='Force rebuilding the native binary')
+    parser.add_argument('--ask-pass', action='store_true', help='Prompt once for the VPS SSH password instead of using a key')
     args = parser.parse_args(argv)
     try:
         config = json.loads(args.config.read_text()) if args.config.exists() else {}
@@ -116,8 +147,9 @@ def main(argv=None):
         config['ssh_host'] = args.host
     if args.origin:
         config['origin'] = args.origin
+    connections = contextlib.ExitStack()
     try:
-        ssh = ssh_args(config)
+        ssh = connections.enter_context(ssh_connection(config, args.ask_pass))
         origin = resolve_origin(config)
         user_id = remote(ssh, 'id -u', capture=True)
         elevate = '' if user_id == '0' else 'sudo -n '
@@ -178,6 +210,8 @@ def main(argv=None):
         print('Next on Mac: python3 scripts/configure-mac.py')
     except (ValueError, RuntimeError, OSError) as e:
         parser.exit(1, f'Error: {e}\n')
+    finally:
+        connections.close()
 
 
 if __name__ == '__main__':

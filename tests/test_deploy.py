@@ -5,7 +5,7 @@ import json
 import pathlib
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -38,6 +38,39 @@ class DeploymentTests(unittest.TestCase):
                 deploy.resolve_origin({'origin': origin})
         with self.assertRaises(ValueError):
             deploy.ssh_args({'ssh_host': 'root@host', 'ssh_port': True})
+
+    def test_password_login_reuses_one_connection_and_closes_it_on_error(self):
+        calls = []
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return Mock(returncode=0)
+        config = {'ssh_host': 'deploy@host', 'ssh_key': '/missing/key', 'ssh_port': 2222}
+        with patch.object(deploy.subprocess, 'run', side_effect=run), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'deployment stopped'):
+                with deploy.ssh_connection(config, ask_pass=True) as ssh:
+                    self.assertEqual(ssh[1:3], ['-o', 'BatchMode=yes'])
+                    self.assertIn('PubkeyAuthentication=no', ssh)
+                    self.assertNotIn('-i', ssh)
+                    self.assertEqual(ssh[-1], 'deploy@host')
+                    control = next(arg for arg in ssh if arg.startswith('ControlPath='))
+                    self.assertTrue(pathlib.Path(control.split('=', 1)[1]).parent.is_dir())
+                    raise RuntimeError('deployment stopped')
+        self.assertEqual(len(calls), 2)
+        self.assertIn('-M', calls[0][0])
+        self.assertIn('PreferredAuthentications=password', calls[0][0])
+        self.assertIn(control, calls[0][0])
+        self.assertIn(control, calls[1][0])
+        self.assertIn('-O', calls[1][0])
+        self.assertIn('exit', calls[1][0])
+        self.assertNotIn('input', calls[0][1])
+        self.assertFalse(pathlib.Path(control.split('=', 1)[1]).parent.exists())
+
+    def test_failed_password_login_does_not_run_deployment(self):
+        with patch.object(deploy.subprocess, 'run', return_value=Mock(returncode=255)) as run, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'Password SSH login failed'):
+                with deploy.ssh_connection({'ssh_host': 'deploy@host'}, ask_pass=True):
+                    self.fail('A failed login must not enter the deployment')
+        run.assert_called_once()
 
     def test_plan_cannot_install_upload_or_fetch_credentials(self):
         calls = []
