@@ -6,3 +6,4 @@
 /.cargo-cache/
 __pycache__/
 .DS_Store
+/relay.json

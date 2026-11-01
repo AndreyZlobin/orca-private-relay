@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 
 import deploy
+import desired
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 VARIABLES = ['ORCA_RELAY_URL', 'ORCA_CLOUD_API_URL', 'ORCA_CLOUD_AUTH_URL', 'ORCA_PUSH_GATEWAY_URL']
@@ -155,7 +156,7 @@ def connect(profile=None, origin=None, restart=True, code=None):
         raise ValueError('Сначала установите штатную Orca в /Applications/Orca.app')
     if profile and code:
         raise ValueError('Используйте код подключения или файл профиля, а не оба одновременно')
-    if code and origin:
+    if origin and not profile:
         address, key = deploy.resolve_origin({'origin': origin}), None
     else:
         address, key = load_connection(profile, origin)
@@ -225,6 +226,8 @@ def doctor(origin=None):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        argv = ['apply']
     if argv and argv[0] == 'install':
         server_only = '--server-only' in argv
         arguments = [value for value in argv[1:] if value != '--server-only']
@@ -244,6 +247,10 @@ def main(argv=None):
         return
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
+    for name, help_text in [('apply', 'Apply relay.json; ask only for required credentials'),
+                            ('plan', 'Show resolved desired state without accessing the VPS')]:
+        command = commands.add_parser(name, help=help_text)
+        command.add_argument('--config', type=pathlib.Path)
     server = commands.add_parser('install', help='Install/update the VPS, print a code and configure this Mac')
     server.add_argument('--server-only', action='store_true', help='Skip configuring this Mac')
     client = commands.add_parser('connect', help='Configure another Mac; no VPS SSH connection')
@@ -259,7 +266,20 @@ def main(argv=None):
     commands.add_parser('disconnect', help='Restore the previous Mac launch settings')
     commands.add_parser('code', help='Print a fresh one-time connection code; no SSH connection')
     args = parser.parse_args(argv)
-    if args.command == 'connect':
+    if args.command in ['apply', 'plan']:
+        state = desired.load(ROOT, args.config, interactive=args.command == 'apply')
+        if args.command == 'plan':
+            print(json.dumps(state, indent=2, ensure_ascii=False))
+            print('Желаемое состояние; подключения к VPS и изменений нет.')
+        elif state['kind'] == 'client':
+            health(state['origin'])
+            if platform.system() == 'Darwin' and mac_configured(state['origin']):
+                print('Этот Mac уже настроен. Для нового входа используйте ./relay connect ' + state['origin'])
+            else:
+                connect(origin=state['origin'])
+        else:
+            main(desired.install_arguments(state))
+    elif args.command == 'connect':
         if args.address and args.origin and args.address != args.origin:
             parser.error('Specify one Relay address')
         connect(args.profile, args.origin or args.address, not args.no_restart, args.code)

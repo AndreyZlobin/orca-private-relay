@@ -18,6 +18,24 @@ KEY = 'k' * 43
 
 
 class ClientSetupTests(unittest.TestCase):
+    def test_declarative_apply_passes_only_resolved_settings_to_installer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / 'relay.json').write_text(json.dumps({'server': '1.1.1.1', 'configure_mac': False}))
+            (root / '.private').mkdir()
+            (root / '.private/owner.key').write_text(KEY)
+            with patch.object(client, 'ROOT', root), \
+                 patch.object(client.deploy, 'main', return_value={'origin': ORIGIN}) as run, \
+                 patch.object(client, 'print_setup_code', return_value={'code': 'ABCD-EFGH-JKLM'}), \
+                 patch.object(client, 'connect') as connect:
+                client.main([])
+            arguments = run.call_args.args[0]
+            self.assertIn('root@1.1.1.1', arguments)
+            self.assertIn('--ask-pass', arguments)
+            self.assertNotIn('--server-only', arguments)  # handled by our entry point, not deploy.py
+            self.assertIn('https://orca-relay.1-1-1-1.sslip.io', arguments)
+            connect.assert_not_called()
+
     def test_setup_code_never_copies_the_owner_key_or_persists_the_code(self):
         code = 'ABCD-EFGH-JKLM'
         with tempfile.TemporaryDirectory() as directory:

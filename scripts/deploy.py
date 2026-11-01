@@ -125,6 +125,7 @@ def verify_health(origin, timeout=120):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--host', help='SSH destination; root or passwordless sudo required')
+    parser.add_argument('--port', type=int, help='SSH port; overrides the saved port')
     parser.add_argument('--origin', help='HTTPS hostname; omit to derive an sslip.io name from the VPS IPv4')
     parser.add_argument('--config', type=pathlib.Path, default=ROOT / '.private/deploy.json')
     modes = parser.add_mutually_exclusive_group()
@@ -149,6 +150,8 @@ def main(argv=None):
         config['ssh_host'] = args.host
     if args.origin:
         config['origin'] = args.origin
+    if args.port is not None:
+        config['ssh_port'] = args.port
     connections = contextlib.ExitStack()
     try:
         if config.get('ssh_auth') not in [None, 'key', 'password']:
