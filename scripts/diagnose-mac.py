@@ -11,10 +11,14 @@ import re
 import socket
 import ssl
 import subprocess
+import time
 import urllib.parse
 import urllib.request
 
 VARIABLES = ['ORCA_RELAY_URL', 'ORCA_CLOUD_API_URL', 'ORCA_CLOUD_AUTH_URL', 'ORCA_PUSH_GATEWAY_URL']
+EXTRA_URL_VARIABLES = ['ORCA_CLOUD_AUTHORIZE_URL', 'ORCA_CLOUD_SESSION_URL', 'ORCA_CLOUD_REFRESH_URL',
+                       'ORCA_CLOUD_CAPABILITIES_URL', 'ORCA_CLOUD_PROFILE_URL', 'ORCA_CLOUD_ORG_URL',
+                       'ORCA_CLOUD_LOGOUT_URL', 'ORCA_CLOUD_RELAY_TOKEN_URL']
 
 
 def run(*args):
@@ -39,10 +43,39 @@ def public_origin(value):
 
 def process_routes(text):
     result = {}
-    for name in VARIABLES:
+    for name in VARIABLES + EXTRA_URL_VARIABLES:
         values = re.findall(r'(?:^|\s)' + re.escape(name) + r'=([^\s]+)', text)
         result[name] = public_origin(values[-1]) if values else None
     return result
+
+
+def process_report(pid):
+    result = subprocess.run(['/bin/ps', 'eww', '-p', str(pid), '-o', 'command='],
+                            capture_output=True, text=True, timeout=8, check=False)
+    readable = result.returncode == 0 and bool(result.stdout.strip())
+    return {'pid': int(pid), 'process_readable': readable,
+            'started': run('/bin/ps', '-p', str(pid), '-o', 'lstart='),
+            'routes': process_routes(result.stdout) if readable else None}
+
+
+def mobile_bindings(devices, cloud, host_id, now_ms):
+    owner = None
+    if cloud and all(isinstance(cloud.get(k), str) for k in ['userId', 'cloudProfileId']):
+        owner = cloud['userId'] + '\0' + cloud['cloudProfileId'] + '\0' + (cloud.get('activeOrgId') or '')
+    output = []
+    for device in devices:
+        if not isinstance(device, dict) or device.get('scope') != 'mobile':
+            continue
+        binding = device.get('relayBinding')
+        row = {'connection_mode': device.get('mobilePairingConnectionMode'), 'has_relay_binding': isinstance(binding, dict)}
+        if isinstance(binding, dict):
+            expiry = binding.get('inviteExpiresAt')
+            row.update(host_matches=binding.get('relayHostId') == host_id,
+                       owner_matches=binding.get('ownerIdentityKey') == owner if owner else None,
+                       pending_invite='inviteExpiresAt' in binding,
+                       invite_expired=isinstance(expiry, (int, float)) and expiry <= now_ms)
+        output.append(row)
+    return output
 
 
 def websocket_probe(origin, host_id):
@@ -90,6 +123,7 @@ def main():
     report['orca_running'] = bool(pids)
     report['launch_environment'] = {name: public_origin(run('/bin/launchctl', 'getenv', name)) for name in VARIABLES}
     report['running_orca_environment'] = [process_routes(run('/bin/ps', 'eww', '-p', pid, '-o', 'command=')) for pid in pids]
+    report['running_orca_processes'] = [process_report(pid) for pid in pids]
     data = pathlib.Path.home() / 'Library/Application Support/Orca'
     host_id = 'connectivity-probe'
     identity = data / 'orca-e2ee-keypair.json'
@@ -100,10 +134,26 @@ def main():
             host_id = base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).decode().rstrip('=')[:16]
             report['relay_host_id'] = host_id
     profiles = data / 'orca-profile-index.json'
+    cloud = None
     if profiles.exists():
         index = json.loads(profiles.read_text())
         profile = next((p for p in index.get('profiles', []) if p.get('id') == index.get('activeProfileId')), {})
         report['profile_linked_to_relay_account'] = bool(profile.get('cloud'))
+        cloud = profile.get('cloud')
+        profile_id = profile.get('id')
+        if isinstance(profile_id, str) and re.fullmatch(r'[a-zA-Z0-9_-]+', profile_id):
+            session = data / 'profiles' / profile_id / 'account-session.json.enc'
+            report['saved_account_session_exists'] = session.is_file()
+    devices = data / 'orca-devices.json'
+    if devices.exists():
+        entries = json.loads(devices.read_text())
+        if isinstance(entries, list):
+            report['mobile_bindings'] = mobile_bindings(entries, cloud, host_id, time.time() * 1000)
+    runtime = data / 'orca-runtime.json'
+    if runtime.exists():
+        pid = json.loads(runtime.read_text()).get('pid')
+        if isinstance(pid, int) and pid > 0:
+            report['runtime_process'] = process_report(pid)
     try:
         with urllib.request.urlopen(origin + '/healthz', timeout=8) as response:
             health = json.loads(response.read(16384))
