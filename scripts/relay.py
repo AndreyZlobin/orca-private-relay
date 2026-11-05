@@ -11,7 +11,6 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.error
 import urllib.request
 
@@ -127,16 +126,8 @@ def print_setup_code(origin, key):
     return result
 
 
-def restart_orca():
-    subprocess.run(['osascript', '-e', 'tell application id "com.stablyai.orca" to quit'], check=True, capture_output=True)
-    for _ in range(30):
-        state = subprocess.run(['osascript', '-e', 'application id "com.stablyai.orca" is running'],
-                               check=True, capture_output=True, text=True)
-        if state.stdout.strip() == 'false':
-            subprocess.run(['open', '-a', 'Orca'], check=True)
-            return
-        time.sleep(0.5)
-    raise ValueError('Orca ожидает завершения или диалога сохранения. Закройте её и откройте снова.')
+def restart_orca(origin):
+    subprocess.run([sys.executable, str(ROOT / 'scripts/restart-mac.py'), '--origin', origin], check=True)
 
 
 def mac_configured(origin):
@@ -186,7 +177,7 @@ def connect(profile=None, origin=None, restart=True, code=None):
         os.fchmod(handle.fileno(), 0o600)
         json.dump({'origin': address}, handle)
     if restart:
-        restart_orca()
+        restart_orca(address)
     # Clipboard is filled only after all checks; the key is never printed or put in argv.
     subprocess.run(['pbcopy'], input=credential.encode(), check=True)
     print('Техническая настройка выполнена. Данные для входа уже в буфере обмена.')
