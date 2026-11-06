@@ -105,7 +105,7 @@ fn login_response(q: &LoginQuery, error: Option<&str>, status: StatusCode) -> Re
     let mut r = (status, Html(html)).into_response();
     r.headers_mut()
         .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
-    r.headers_mut().insert(header::CONTENT_SECURITY_POLICY,"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'".parse().unwrap());
+    r.headers_mut().insert(header::CONTENT_SECURITY_POLICY,"default-src 'none'; style-src 'unsafe-inline'; form-action 'self' http://127.0.0.1:*; frame-ancestors 'none'; base-uri 'none'".parse().unwrap());
     r
 }
 pub async fn authorize(
